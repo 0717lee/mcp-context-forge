@@ -1739,6 +1739,7 @@ testing-up:                                ## Start testing stack (Locust + A2A 
 	@echo "Service              URL                           Purpose"
 	@echo "──────────────────────────────────────────────────────────────────────────"
 	@echo "Gateway (nginx)      http://localhost:8080         API proxy"
+	@echo "Gateway UX (nginx)   http://localhost:3100         Gateway Supported UX"
 	@echo "Locust Web UI        http://localhost:8089         Load testing (master+workers)"
 	@echo "Fast Test Server     http://localhost:8880         MCP benchmark target"
 	@echo "A2A Echo Agent       http://localhost:9100         A2A protocol target"
