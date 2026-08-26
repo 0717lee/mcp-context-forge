@@ -280,6 +280,33 @@ gateway:
     - KEY_FILE_PASSWORD=${KEY_FILE_PASSWORD}  # From .env file
 ```
 
+### Exposing TLS Cipher Suite and Protocol Version Constraints
+
+To enforce stronger security on the gateway's direct HTTPS listener (Option 1 architecture), you can optionally restrict the allowed SSL/TLS cipher suites and minimum protocol version using the following environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SSL_CIPHERS` | (empty — Python defaults) | Colon-separated list of allowed OpenSSL cipher suites |
+| `SSL_VERSION` | (empty — Gunicorn default) | Numeric constant from Python's `ssl` module defining the protocol version |
+
+#### Recommended Production Configuration
+
+To restrict the gateway to secure modern ciphers and enforce a minimum of TLS 1.2 (or TLS 1.3 depending on Python/OpenSSL platform capabilities), configure these variables in your `.env` or `docker-compose.yml`:
+
+```yaml
+gateway:
+  environment:
+    - SSL=true
+    - CERT_FILE=/app/certs/cert.pem
+    - KEY_FILE=/app/certs/key.pem
+    # Recommended secure cipher suites (restricts to high-strength modern ciphers)
+    - SSL_CIPHERS=ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305
+    # Enforce minimum protocol version (5 maps to ssl.PROTOCOL_TLSv1_2 / TLS 1.2 minimum)
+    - SSL_VERSION=5
+```
+
+These variables are directly forwarded to Gunicorn's `--ciphers` and `--ssl-version` command-line flags.
+
 ### Mount Certificates
 
 Ensure certificates are mounted in the gateway container:
