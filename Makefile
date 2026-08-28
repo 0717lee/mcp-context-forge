@@ -359,6 +359,11 @@ build-ui:
 		exit 1; \
 	fi
 
+# help: catalog-icons         - Fetch and bundle catalog icons as local static PNG assets
+.PHONY: catalog-icons
+catalog-icons:
+	@$(UV_BIN) run python scripts/fetch_catalog_icons.py
+
 .PHONY: update
 update:
 	@echo "⬆️   Updating installed dependencies..."
@@ -429,7 +434,9 @@ setup:                          ## 🚀 First-time setup: copy .env.example → 
 # help: certs-mcp-plugin     - Generate plugin server certificate (requires PLUGIN_NAME=name)
 # help: certs-mcp-all        - Generate complete MCP mTLS infrastructure (reads plugins from config.yaml)
 # help: certs-mcp-check      - Check expiry dates of MCP certificates
+# help: certs-client         - Generate a client CA and test client cert for inbound mTLS
 # help: serve-ssl            - Run Gunicorn behind HTTPS on :4444 (uses ./certs)
+# help: serve-ssl-mtls       - Run Gunicorn with HTTPS + inbound mTLS (requires CA_CERTS=...)
 # help: dev                  - Run fast-reload dev server (uvicorn)
 # help: dev-echo             - Run dev server with SQL query logging (N+1 debugging)
 # help: dev-remote           - Run dev server with remote debugging (debugpy on port 5678)
@@ -438,8 +445,8 @@ setup:                          ## 🚀 First-time setup: copy .env.example → 
 # help: stop-serve           - Stop gunicorn production server (port 4444)
 # help: run                  - Execute helper script ./run.sh
 
-.PHONY: serve serve-ssl dev dev-remote stop stop-dev stop-serve run \
-        certs certs-jwt certs-jwt-ecdsa certs-all certs-mcp-ca certs-mcp-gateway certs-mcp-plugin certs-mcp-all certs-mcp-check \
+.PHONY: serve serve-ssl serve-ssl-mtls dev dev-remote stop stop-dev stop-serve run \
+        certs certs-client certs-jwt certs-jwt-ecdsa certs-all certs-mcp-ca certs-mcp-gateway certs-mcp-plugin certs-mcp-all certs-mcp-check \
         js-build
 
 ## --- JS build ----------------------------------------------------------------
@@ -456,6 +463,22 @@ serve: install js-build                  ## Run production server with Gunicorn 
 
 serve-ssl: js-build certs        ## Run Gunicorn with TLS enabled
 	SSL=true CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem ./run-gunicorn.sh
+
+# CERT_REQS defaults to 2 (required) but is expanded with $(or ...) rather than
+# shell-style ${CERT_REQS:-2}: Make expands ${...} first and would silently
+# resolve the latter to the empty string, which run-gunicorn.sh then defaults to
+# 0 - i.e. mTLS quietly disabled while the target claims to enforce it.
+serve-ssl-mtls: js-build certs   ## Run Gunicorn with TLS and inbound client certificate auth
+	@if [ -z "$(CA_CERTS)" ]; then \
+		echo "❌  CA_CERTS is required. Example:"; \
+		echo "   make certs-client && make serve-ssl-mtls CA_CERTS=certs/client/ca-cert.pem"; \
+		exit 1; \
+	fi
+	SSL=true CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem \
+	CA_CERTS=$(CA_CERTS) CERT_REQS=$(or $(CERT_REQS),2) \
+	LOOPBACK_CLIENT_CERT=$(or $(LOOPBACK_CLIENT_CERT),certs/client/client-cert.pem) \
+	LOOPBACK_CLIENT_KEY=$(or $(LOOPBACK_CLIENT_KEY),certs/client/client-key.pem) \
+	./run-gunicorn.sh
 
 dev:
 	@echo "🚀 Starting development server with CSS watch..."
@@ -542,6 +565,35 @@ certs:                           ## Generate ./certs/cert.pem & ./certs/key.pem 
 	@sudo chgrp 0 certs/key.pem certs/cert.pem || \
 		(echo "⚠️  Warning: Could not set group to 0 (container may not be able to read key)" && \
 		 echo "   Run manually: sudo chgrp 0 certs/key.pem certs/cert.pem")
+
+.PHONY: certs-client
+certs-client:                    ## Generate client CA + test client cert for inbound mTLS (idempotent)
+	@if [ -f certs/client/ca-cert.pem ] && [ -f certs/client/client-cert.pem ]; then \
+		echo "🔏  Existing client certificates found in ./certs/client - skipping generation."; \
+		echo "    Delete ./certs/client to regenerate (this invalidates any running server's trust chain)."; \
+	else \
+		echo "🔏  Generating client CA and test client certificate (1 year)..."; \
+		mkdir -p certs/client; \
+		openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
+			-keyout certs/client/ca-key.pem -out certs/client/ca-cert.pem \
+			-subj "/CN=ContextForge Client CA"; \
+		openssl req -newkey rsa:4096 -nodes \
+			-keyout certs/client/client-key.pem -out certs/client/client-csr.pem \
+			-subj "/CN=test-client"; \
+		openssl x509 -req -in certs/client/client-csr.pem \
+			-CA certs/client/ca-cert.pem -CAkey certs/client/ca-key.pem \
+			-CAcreateserial -out certs/client/client-cert.pem -days 365 -sha256; \
+		rm -f certs/client/client-csr.pem; \
+		echo "✅  Client CA and client certificate written to ./certs/client/"; \
+	fi
+	@echo "🔐  Setting file permissions..."
+	@chmod 644 certs/client/ca-cert.pem certs/client/client-cert.pem
+	@chmod 640 certs/client/ca-key.pem certs/client/client-key.pem
+	@echo ""
+	@echo "⚠️   These are TEST credentials. certs/client/ca-key.pem is a real CA key -"
+	@echo "    use your own PKI in production."
+	@echo "💡  Start the gateway with inbound mTLS:"
+	@echo "    make serve-ssl-mtls CA_CERTS=certs/client/ca-cert.pem"
 
 .PHONY: certs-passphrase
 certs-passphrase:                ## Generate self-signed cert with passphrase-protected key
@@ -1582,10 +1634,9 @@ langfuse-up:                               ## Start Langfuse LLM observability s
 	$(LANGFUSE_COMPOSE) up -d --force-recreate gateway
 	@# Nginx resolves gateway backends when it starts; recreate it after gateway churn.
 	$(LANGFUSE_COMPOSE) up -d --no-deps --force-recreate nginx
-	@# Bring up the same lightweight MCP/A2A test targets used by the live smoke
-	@# suites so Langfuse runs can generate real end-to-end tool traffic without
-	@# depending on stale registrations from the testing profile.
-	$(LANGFUSE_COMPOSE) up -d fast_test_server register_fast_test a2a_echo_agent register_a2a_echo
+	@# Bring up the Fast Time and A2A test targets used by live smoke suites
+	@# so Langfuse runs can generate real end-to-end traffic.
+	$(LANGFUSE_COMPOSE) up -d fast_time_server register_fast_time a2a_echo_agent register_a2a_echo
 	$(VERIFY_LANGFUSE_GATEWAY_EXPORT)
 	@echo "⏳ Waiting for Langfuse to be ready..."
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
@@ -1701,8 +1752,8 @@ langfuse-monitoring-down:                  ## Stop Langfuse + monitoring stack
 	@echo "✅ Langfuse + monitoring stack stopped."
 
 # =============================================================================
-# help: 🧪 TESTING STACK (Locust + A2A echo + fast_test_server)
-# help: testing-up            - Start testing stack (Locust + A2A echo + fast_test_server)
+# help: 🧪 TESTING STACK (Locust + A2A echo)
+# help: testing-up            - Start testing stack (Locust + A2A echo)
 # help: testing-down          - Stop testing stack
 # help: testing-status        - Show status of testing services
 # help: testing-logs          - Show testing stack logs
@@ -1714,8 +1765,8 @@ HOST_UID ?= $(shell id -u 2>/dev/null || echo 1000)
 HOST_GID ?= $(shell id -g 2>/dev/null || echo 1000)
 
 .PHONY: testing-up
-testing-up:                                ## Start testing stack (Locust + A2A echo + fast_test_server)
-	@echo "🧪 Starting testing stack (fast_test_server)..."
+testing-up:                                ## Start testing stack (Locust + Fast Time + A2A echo)
+	@echo "🧪 Starting testing stack..."
 	@echo "   🦗 Locust workers: $(TESTING_LOCUST_WORKERS) (override: TESTING_LOCUST_WORKERS=4 make testing-up)"
 	@# Fail early if port 8080 is already bound (nginx needs it)
 	@if lsof -Pi :8080 -sTCP:LISTEN >/dev/null 2>&1 || ss -tlnp 2>/dev/null | grep -q ':8080'; then \
@@ -1735,7 +1786,7 @@ testing-up:                                ## Start testing stack (Locust + A2A 
 	@echo "──────────────────────────────────────────────────────────────────────────"
 	@echo "Gateway (nginx)      http://localhost:8080         API proxy"
 	@echo "Locust Web UI        http://localhost:8089         Load testing (master+workers)"
-	@echo "Fast Test Server     http://localhost:8880         MCP benchmark target"
+	@echo "Fast Time Server     http://localhost:8888         MCP benchmark target"
 	@echo "A2A Echo Agent       http://localhost:9100         A2A protocol target"
 	@echo "MCP Inspector        http://localhost:6274         Interactive MCP client"
 	@echo "Keycloak             http://localhost:8180         SSO / OAuth 2.1 provider (realm: mcp-gateway)"
@@ -1743,7 +1794,7 @@ testing-up:                                ## Start testing stack (Locust + A2A 
 	@echo "   🔒 For DAST security scanning, also start ZAP: make testing-zap-up"
 	@echo ""
 	@echo "   📝 Auto-registered:"
-	@echo "      • MCP gateway: fast_test (from fast_test_server)"
+	@echo "      • MCP gateway: fast_time (from fast_time_server)"
 	@echo "      • A2A agent:   a2a-echo-agent"
 	@echo ""
 	@echo "   Next:"
@@ -1791,7 +1842,7 @@ testing-down:                              ## Stop testing stack
 .PHONY: testing-status
 testing-status:                            ## Show status of testing services
 	@echo "🧪 Testing stack status:"
-	@$(COMPOSE_CMD_MONITOR) ps | grep -E "(fast_test|a2a_echo_agent|locust|mcp_inspector)" || \
+	@$(COMPOSE_CMD_MONITOR) ps | grep -E "(fast_time_server|register_fast_time|a2a_echo_agent|locust|mcp_inspector)" || \
 		echo "   No testing services running. Start with 'make testing-up'"
 	@WORKERS=$$($(COMPOSE_CMD_MONITOR) ps | grep -c "locust_worker" || true); \
 		echo "   🦗 Locust workers: $$WORKERS"

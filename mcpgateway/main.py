@@ -145,6 +145,7 @@ from mcpgateway.schemas import (
     CursorPaginatedServersResponse,
     CursorPaginatedToolsResponse,
     GatewayCreate,
+    GatewayImpactPreview,
     GatewayRead,
     GatewayRefreshResponse,
     GatewayUpdate,
@@ -180,7 +181,15 @@ from mcpgateway.services.content_security import ContentPatternError, ContentSiz
 from mcpgateway.services.dataplane_publisher import DataplanePublisherService
 from mcpgateway.services.email_auth_service import EmailAuthService
 from mcpgateway.services.export_service import ExportError, ExportService
-from mcpgateway.services.gateway_service import GatewayConnectionError, GatewayDuplicateConflictError, GatewayError, GatewayLookupConflictError, GatewayNameConflictError, GatewayNotFoundError
+from mcpgateway.services.gateway_service import (
+    GatewayConnectionError,
+    GatewayCredentialError,
+    GatewayDuplicateConflictError,
+    GatewayError,
+    GatewayLookupConflictError,
+    GatewayNameConflictError,
+    GatewayNotFoundError,
+)
 from mcpgateway.services.import_service import ConflictStrategy, ImportConflictError
 from mcpgateway.services.import_service import ImportError as ImportServiceError
 from mcpgateway.services.import_service import ImportService, ImportValidationError
@@ -7400,6 +7409,8 @@ async def register_gateway(
     except Exception as ex:
         if isinstance(ex, PermissionError):
             return ORJSONResponse(content={"message": str(ex)}, status_code=status.HTTP_403_FORBIDDEN)
+        if isinstance(ex, GatewayCredentialError):
+            return ORJSONResponse(content={"message": str(ex)}, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         if isinstance(ex, GatewayConnectionError):
             return ORJSONResponse(content={"message": str(ex)}, status_code=status.HTTP_502_BAD_GATEWAY)
         if isinstance(ex, ValueError):
@@ -7443,6 +7454,39 @@ async def get_gateway(gateway_id: str, request: Request, db: Session = Depends(g
         gateway = await gateway_service.get_gateway(db, gateway_id, user_email=auth_user_email, token_teams=auth_token_teams)
         _enforce_scoped_resource_access(request, db, user, f"/gateways/{gateway_id}")
         return gateway
+    except GatewayLookupConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@gateway_router.get("/{gateway_id}/impact-preview", response_model=GatewayImpactPreview)
+@require_permission("gateways.read")
+async def get_gateway_impact_preview(
+    gateway_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> GatewayImpactPreview:
+    """Preview visible virtual servers affected by deleting a gateway.
+
+    Args:
+        gateway_id: Gateway ID, exact name, or slug.
+        request: Incoming request used for scoped access validation.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Layer-1-scoped virtual server IDs and names.
+
+    Raises:
+        HTTPException: 404 if the gateway is missing or hidden; 409 for an ambiguous identifier.
+    """
+    try:
+        auth_user_email, auth_token_teams = get_scoped_resource_access_context(request, user)
+        preview = await gateway_service.get_gateway_impact_preview(db, gateway_id, user_email=auth_user_email, token_teams=auth_token_teams)
+        _enforce_scoped_resource_access(request, db, user, f"/gateways/{preview.gateway_id}")
+        return preview
     except GatewayLookupConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except GatewayNotFoundError as e:
@@ -7503,6 +7547,8 @@ async def update_gateway(
             return ORJSONResponse(content={"message": str(ex)}, status_code=403)
         if isinstance(ex, GatewayNotFoundError):
             return ORJSONResponse(content={"message": "Gateway not found"}, status_code=status.HTTP_404_NOT_FOUND)
+        if isinstance(ex, GatewayCredentialError):
+            return ORJSONResponse(content={"message": str(ex)}, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
         if isinstance(ex, GatewayConnectionError):
             return ORJSONResponse(content={"message": str(ex)}, status_code=status.HTTP_502_BAD_GATEWAY)
         if isinstance(ex, ValueError):
